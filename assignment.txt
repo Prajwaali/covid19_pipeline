@@ -1,0 +1,234 @@
+sudo -u hdfs hdfs dfsadmin -safemode leave
+
+hadoop fs -mkdir covid
+#transfer the folder from local to HDFS
+hadoop fs -copyFromLocal /home/cloudera/Desktop/shared/covid_data /user/cloudera/covid
+note: to overwrite the existing file use:
+hadoop fs -copyFromLocal -f  /home/cloudera/Desktop/shared/covid_data /user/cloudera/covid
+
+#encripted password creation
+hadoop credential create mysql.covid.password -provider jceks://hdfs/user/cloudera/mysql.covid.password
+
+#creating table database and table in my sql
+create database covid_project;
+
+create table Covid19_india(
+Sno int,
+Date varchar(20),
+State_UnionTerritory varchar(40),
+Cured int,
+Deaths int,
+Confirmed int,
+primary key(Sno)
+);
+
+create table StatewiseTestingDetails(
+Seq int,
+Date varchar(20),
+State varchar(40),
+TotalSamples int,
+Negative int,
+Positive int,
+primary key(Seq)
+);
+
+create table StatewiseTestingDetails_stage(
+Seq int,
+Date varchar(20),
+State varchar(40),
+TotalSamples int,
+Negative int,
+Positive int,
+primary key(Seq)
+);
+
+create table Covid19_india_stage(
+Sno int,
+Date varchar(20),
+State_UnionTerritory varchar(40),
+Cured int,
+Deaths int,
+Confirmed int,
+primary key(Sno)
+);
+
+#sqoop job list
+sqoop job --list
+
+#creating export sqoop job
+sqoop job \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/mysql.covid.password \
+--create job_ExportCovid19_india \
+-- export \
+--connect jdbc:mysql://quickstart.cloudera:3306/covid_project \
+--username root \
+--password-alias mysql.covid.password \
+--table Covid19_india \
+--staging-table Covid19_india_stage \
+--clear-staging-table \
+--export-dir /user/cloudera/covid/covid_data/Covid19_india.csv \
+--fields-terminated-by ','
+
+sqoop job \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/mysql.covid.password \
+--create job_ExportStatewiseTestingDetails \
+-- export \
+--connect jdbc:mysql://quickstart.cloudera:3306/covid_project \
+--username root \
+--password-alias mysql.covid.password \
+--table StatewiseTestingDetails \
+--staging-table StatewiseTestingDetails_stage \
+--clear-staging-table \
+--export-dir /user/cloudera/covid/covid_data/StatewiseTestingDetails.csv \
+--fields-terminated-by ','
+
+#executing the sqoop job
+sqoop job --exec job_ExportCovid19_india
+sqoop job --exec job_ExportStatewiseTestingDetails
+
+#commit in sql
+mysql> commit;
+
+#creating import sqoop job
+sqoop job \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/mysql.covid.password \
+--create job_ImportCovid19_india \
+-- import \
+--connect jdbc:mysql://quickstart.cloudera:3306/covid_project \
+--username root \
+--password-alias mysql.covid.password \
+--table Covid19_india \
+--warehouse-dir /user/cloudera/covid/ID_out 1>imp_job_covi_wornings 2>imp_job_covi_error \
+--split-by Sno \
+--incremental append \
+--check-column Sno \
+--last-value 0 \
+--compress
+
+
+sqoop job \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/mysql.covid.password \
+--create job_ImportStatewiseTestingDetails \
+-- import \
+--connect jdbc:mysql://quickstart.cloudera:3306/covid_project \
+--username root \
+--password-alias mysql.covid.password \
+--table StatewiseTestingDetails \
+--warehouse-dir /user/cloudera/covid/SD_out 1>imp_job_state_wornings 2>imp_job_state_error \
+--split-by Seq \
+--incremental append \
+--check-column Seq \
+--last-value 0 \
+--compress
+
+#executing the sqoop job
+sqoop job --exec job_ImportCovid19_india 
+sqoop job --exec job_ImportStatewiseTestingDetails
+
+#opening hive
+beeline -u jdbc:hive2://
+
+#creating database in hive
+create database if not exists Covid;
+use covid;
+
+
+#creating external hive on top of hadoop
+create external table IF NOT EXISTS Covid19_india 
+(Sno int,
+Date string,
+State_UnionTerritory string,
+Cured int,
+Deaths int,
+Confirmed int)
+COMMENT 'Table to store All india Covid details'
+row format delimited fields terminated by ','
+stored as orc
+LOCATION '/user/cloudera/covid/ID_out/Covid19_india';
+
+
+create external table IF NOT EXISTS StatewiseTestingDetails
+(Seq int,
+Date string,
+State string,
+TotalSamples int,
+Negative int,
+Positive int)
+COMMENT 'Table to store Statewise Covid Test Details'
+row format delimited
+fields terminated by ','
+stored as orc
+LOCATION '/user/cloudera/covid/SD_out/StatewiseTestingDetails';
+
+
+#CREATE DIRECTORIES IN HDFS for the Dynamically created Partitions:
+hadoop fs -mkdir /user/cloudera/covid/partitions_StatewiseTestingDetails
+hadoop fs -mkdir /user/cloudera/covid/partitions_Covid19_india
+
+#Enabling Dynamic Partitioning and Bucketing in Hive:
+set hive.exec.dynamic.partition = true;
+set hive.exec.dynamic.partition.mode = nonstrict;
+set hive.enforce.bucketing = true;
+
+
+#ORC EXTERNAL TABLE CREATION IN HIVE:
+
+CREATE EXTERNAL TABLE IF NOT EXISTS Covid19_india_ORC
+(Sno int,
+Date string,
+Cured int,
+Deaths int,
+Confirmed int)
+PARTITIONED BY (State_UnionTerritory STRING)
+CLUSTERED BY (Date) into 4 BUCKETS
+STORED AS ORC
+LOCATION '/user/cloudera/covid/partitions_Covid19_india'
+TBLPROPERTIES('orc.compress' = 'SNAPPY');
+
+CREATE EXTERNAL TABLE IF NOT EXISTS StatewiseTestingDetails_ORC
+(Seq int,
+Date string,
+TotalSamples int,
+Negative int,
+Positive int)
+PARTITIONED BY (State STRING)
+CLUSTERED BY (Date) into 4 BUCKETS
+STORED AS ORC
+LOCATION '/user/cloudera/covid/partitions_StatewiseTestingDetails'
+TBLPROPERTIES('orc.compress' = 'SNAPPY');
+
+#Load data to the optimized hive tables from normal hive tables.
+
+INSERT OVERWRITE TABLE Covid19_india_ORC
+PARTITION (State_UnionTerritory)
+SELECT Sno,from_unixtime(unix_timestamp(Date,'dd/M/yy'),'yyyy-MM-dd'),Cured,Deaths,Confirmed,State_UnionTerritory
+FROM Covid19_india;
+
+INSERT OVERWRITE TABLE StatewiseTestingDetails_ORC
+PARTITION (State)
+SELECT Seq,from_unixtime(unix_timestamp(Date,'M/dd/yyyy'),'yyyy-MM-dd'),
+TotalSamples,Negative,Positive,State
+FROM StatewiseTestingDetails;
+
+
+#Inner Join two tables in Hive and get a consolidated table using Map-Side Join
+
+set hive.auto.convert.join = false;
+set hive.ignore.mapjoin.hint = false;
+
+SELECT /*+ MAPJOIN(T) */
+T.State,T.Date,T.TotalSamples,T.Negative,T.Positive,C.Cured,C.Deaths,C.Confirmed
+FROM StatewiseTestingDetails_ORC T JOIN Covid19_india_ORC C
+ON (C.State_UnionTerritory = T.State) AND (C.Date = T.Date) LIMIT 100;
+
+SELECT /*+ MAPJOIN(T)*/
+T.State,T.Date,T.TotalSamples,T.Negative,T.Positive,C.Cured,C.Deaths,C.Confirmed
+FROM StatewiseTestingDetails_ORC T JOIN Covid19_india_ORC C
+ON (C.State_UnionTerritory = T.State) AND (C.Date = T.Date);
+
+#We can create a final consolidated table as follows:
+CREATE TABLE covid_details AS
+SELECT /*+ MAPJOIN(T)*/
+T.State,T.Date,T.TotalSamples,T.Negative,T.Positive,C.Cured,C.Deaths,C.Confirmed
+FROM StatewiseTestingDetails_ORC T JOIN Covid19_india_ORC C
+ON (C.State_UnionTerritory = T.State) AND (C.Date = T.Date);
